@@ -18,18 +18,6 @@ struct ev_io_http {
 
 extern int opterr;
 
-char *trim(const char *str) {
-    size_t l = 0;
-    size_t r = strlen(str);
-    while (l < r && isspace(str[l])) l++;
-    while (r > 0 && isspace(str[r-1])) r--;
-    if (l > r) return "";
-    char *res = (char *)malloc((r - l + 1) * sizeof(char));
-    res[r-l] = '\0';
-    memcpy(res, str + l, r - l);
-    return res;
-}
-
 int parse_cli_args(int argc, char *const argv[], char **ip, int *port, char **dir) {
     int opt;
     opterr = 0;
@@ -85,12 +73,81 @@ int start_socket(char *ip, int port) {
     return sd;
 }
 
+char *get_path_from_http_request(char *http_request) {
+    size_t l = strlen(http_request);
+    size_t b = 0, e = 0;
+    while (b < l && http_request[b] != '/') b++;
+    if (b == l) return NULL;
+    e = b + 1;
+    while (e < l && http_request[e] != ' ' && http_request[e] != '?') e++;
+    if (e == l) return NULL;
+    char *path = (char *)malloc(e - b + 1);
+    memcpy(path, http_request + b, e - b);
+    path[e-b] = '\0';
+    return path;
+}
+
+void process_http_request(char *input, char *root_dir, char *output) {
+    memset(output, '\0', CLIENT_BUF_OUT_SIZE);
+
+    int status_code = 0;
+    char *status_description;
+    char *body = NULL;
+    char headers[4096];
+    memset(headers, '\0', 4096);
+    strcat(headers, "Content-Type: text/html\r\n");
+
+    char *path = get_path_from_http_request(input);
+    if (path != NULL) {
+        char *full_path = (char *)malloc(strlen(root_dir) + strlen(path) + sizeof("\0"));
+        strcpy(full_path, root_dir);
+        strcat(full_path, path);
+        if (access(full_path, F_OK) == 0) {
+            FILE *f = fopen(full_path, "r");
+            if (f == NULL) {
+                status_code = 403;
+                status_description = "FORBIDDEN";
+            } else {
+                fseek(f, 0, SEEK_END);
+                long f_size = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                body = (char *)malloc(f_size + 1);
+                fread(body, 1, f_size, f);
+                body[f_size] = '\0';
+                fclose(f);
+
+                char cl_header[1024];
+                sprintf(cl_header, "Content-Length: %d\r\n", f_size);
+                strcat(headers, cl_header);
+
+                status_code = 200;
+                status_description = "OK";
+            }
+        } else {
+            status_code = 404;
+            status_description = "NOT FOUND";
+        }
+    } else {
+        status_code = 400;
+        status_description = "BAD REQUEST";
+    }
+    sprintf(
+        output,
+        "HTTP/1.0 %d %s\r\n%s\r\n%s",
+        status_code,
+        status_description,
+        headers == NULL ? "" : headers,
+        body == NULL ? "" : body
+    );
+}
+
 void read_from_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     struct ev_io_http *w = (struct ev_io_http *)watcher;
 
     char buf_in[CLIENT_BUF_IN_SIZE];
-    // TODO: view right way to use buffered recv
+    // TODO: use buffered recv
     int read_len = recv(w->io.fd, &buf_in, CLIENT_BUF_IN_SIZE, MSG_NOSIGNAL);
+    printf("recv: %d bytes\n", read_len);
     if (read_len == -1) {
         perror("recv");
         exit(EXIT_FAILURE);
@@ -102,17 +159,14 @@ void read_from_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revent
     }
 
     char buf_out[CLIENT_BUF_OUT_SIZE];
+    process_http_request(buf_in, w->root_dir, buf_out);
 
-    char *path = (char *)malloc(strlen(w->root_dir) + sizeof("/") + strlen(buf_in) + sizeof("\0"));
-    strcpy(path, w->root_dir);
-    strcat(path, "/");
-    strcat(path, trim(buf_in));
-    if (access(path, F_OK) == 0) {
-        strcpy(buf_out, "200");
-    } else {
-        strcpy(buf_out, "404");
-    }
+    // TODO: use buffered send
     send(watcher->fd, buf_out, strlen(buf_out) + 1, MSG_NOSIGNAL);
+
+    shutdown(w->io.fd, SHUT_RDWR);
+    close(w->io.fd);
+    ev_io_stop(loop, &w->io);
 }
 
 void accept_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
