@@ -228,6 +228,25 @@ void start_server(char *ip, int port, char *root_dir) {
     }
 }
 
+void daemonize() {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    }
+    if (pid > 0) {
+        printf("new pid server: %d\n", pid);
+        exit(EXIT_SUCCESS);
+    }
+    if (setsid() == -1) {
+        perror("setsid");
+        exit(EXIT_FAILURE);
+    }
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+}
+
 int main(int argc, char *const argv[]) {
     char *ip;
     int port = 0;
@@ -237,6 +256,8 @@ int main(int argc, char *const argv[]) {
         printf("Invalid args\n");
         exit(EXIT_FAILURE);
     }
+
+    daemonize();
 
     char log_msg[256];
     sprintf(log_msg, "Server will be run with params: host %s; port %d; dir %s", ip, port, dir);
