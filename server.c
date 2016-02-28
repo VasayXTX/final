@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <libev/ev.h>
+#include <time.h>
 
 #define CLIENT_BUF_IN_SIZE 4096
 #define CLIENT_BUF_OUT_SIZE 4096
@@ -17,6 +18,36 @@ struct ev_io_http {
 };
 
 extern int opterr;
+
+void log_info(char *msg) {
+    static FILE *f_log = NULL;
+    if (f_log == NULL) {
+        f_log = fopen("info.log", "w");
+        if (f_log == NULL) {
+            perror("fopen serverl.log");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    time_t raw_cur_time;
+    time(&raw_cur_time);
+    struct tm *cur_time = localtime(&raw_cur_time);
+
+    fprintf(
+        f_log,
+        "%04d-%02d-%02dT%02d:%02d:%02d ",
+        1900 + cur_time->tm_year,
+        cur_time->tm_mon,
+        cur_time->tm_mday,
+        cur_time->tm_hour,
+        cur_time->tm_min,
+        cur_time->tm_sec
+    );
+    fprintf(f_log, "\"");
+    fprintf(f_log, msg);
+    fprintf(f_log, "\"\n");
+    fflush(f_log);
+}
 
 int parse_cli_args(int argc, char *const argv[], char **ip, int *port, char **dir) {
     int opt;
@@ -147,7 +178,11 @@ void read_from_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revent
     char buf_in[CLIENT_BUF_IN_SIZE];
     // TODO: use buffered recv
     int read_len = recv(w->io.fd, &buf_in, CLIENT_BUF_IN_SIZE, MSG_NOSIGNAL);
-    printf("recv: %d bytes\n", read_len);
+
+    char log_msg[128];
+    sprintf(log_msg, "recv: %d bytes", read_len);
+    log_info(log_msg);
+
     if (read_len == -1) {
         perror("recv");
         exit(EXIT_FAILURE);
@@ -179,6 +214,20 @@ void accept_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) 
     ev_io_start(loop, &watcher_client->io);
 }
 
+void start_server(char *ip, int port, char *root_dir) {
+    int sd = start_socket(ip, port);
+
+    struct ev_loop *loop = ev_default_loop(0);
+    struct ev_io_http watcher_accept;
+    watcher_accept.root_dir = root_dir;
+    ev_io_init(&watcher_accept.io, accept_client_cb, sd, EV_READ);
+    ev_io_start(loop, &watcher_accept.io);
+
+    while (1) {
+        ev_loop(loop, 0);
+    }
+}
+
 int main(int argc, char *const argv[]) {
     char *ip;
     int port = 0;
@@ -189,21 +238,11 @@ int main(int argc, char *const argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    printf("host: %s\n", ip);
-    printf("port: %d\n", port);
-    printf("dir: %s\n", dir);
+    char log_msg[256];
+    sprintf(log_msg, "Server will be run with params: host %s; port %d; dir %s", ip, port, dir);
+    log_info(log_msg);
 
-    int sd = start_socket(ip, port);
-
-    struct ev_loop *loop = ev_default_loop(0);
-    struct ev_io_http watcher_accept;
-    watcher_accept.root_dir = dir;
-    ev_io_init(&watcher_accept.io, accept_client_cb, sd, EV_READ);
-    ev_io_start(loop, &watcher_accept.io);
-
-    while (1) {
-        ev_loop(loop, 0);
-    }
+    start_server(ip, port, dir);
 
     free(ip);
     free(dir);
