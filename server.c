@@ -8,13 +8,24 @@
 #include <netinet/in.h>
 #include <libev/ev.h>
 #include <time.h>
+#include <pthread.h>
 
 #define CLIENT_BUF_IN_SIZE 4096
 #define CLIENT_BUF_OUT_SIZE 4096
 
+#define WORKERS_COUNT 4
+
 struct ev_io_http {
     struct ev_io io;
     char *root_dir;
+    unsigned int index;
+    pthread_mutex_t *mutex;
+};
+
+struct pthread_ev {
+    struct ev_loop *loop;
+    struct ev_io *watcher;
+    char buf_in[CLIENT_BUF_IN_SIZE];
 };
 
 extern int opterr;
@@ -172,7 +183,29 @@ void process_http_request(char *input, char *root_dir, char *output) {
     );
 }
 
-void read_from_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+void *read_client_handler(void *arg) {
+    struct pthread_ev *pth_ev = (struct pthread_ev *)arg;
+
+    struct ev_io_http *w = (struct ev_io_http *)pth_ev->watcher;
+
+    char buf_out[CLIENT_BUF_OUT_SIZE];
+    process_http_request(pth_ev->buf_in, w->root_dir, buf_out);
+
+    // TODO: use buffered send
+    send(w->io.fd, buf_out, strlen(buf_out) + 1, MSG_NOSIGNAL);
+
+    shutdown(w->io.fd, SHUT_RDWR);
+    close(w->io.fd);
+
+    ev_io_stop(pth_ev->loop, &w->io);
+    free(pth_ev);
+
+    pthread_mutex_unlock(w->mutex);
+    // printf("unlock: %d\n", w->index);
+    free(w);
+}
+
+void read_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     struct ev_io_http *w = (struct ev_io_http *)watcher;
 
     char buf_in[CLIENT_BUF_IN_SIZE];
@@ -186,42 +219,75 @@ void read_from_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revent
     if (read_len == -1) {
         perror("recv");
         exit(EXIT_FAILURE);
-    }
-    if (read_len == 0) {
+    } else if (read_len == 0) {
         ev_io_stop(loop, &w->io);
-        free(w);
         return;
     }
 
-    char buf_out[CLIENT_BUF_OUT_SIZE];
-    process_http_request(buf_in, w->root_dir, buf_out);
+    struct pthread_ev *pth_ev = (struct pthread_ev *)malloc(sizeof(struct pthread_ev));
+    pth_ev->loop = loop;
+    pth_ev->watcher = w;
+    strcpy(pth_ev->buf_in, buf_in);
 
-    // TODO: use buffered send
-    send(watcher->fd, buf_out, strlen(buf_out) + 1, MSG_NOSIGNAL);
+    pthread_mutex_lock(w->mutex);
+    // printf("lock: %d\n", w->index);
 
-    shutdown(w->io.fd, SHUT_RDWR);
-    close(w->io.fd);
-    ev_io_stop(loop, &w->io);
+    // read_client_handler((void *)pth_ev);
+
+    pthread_t thread_handler;
+
+    pthread_attr_t attr;
+    // TODO: check returned value
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    if (
+        pthread_create(
+            &thread_handler,
+            &attr,
+            read_client_handler,
+            (void *)pth_ev
+        ) == -1
+    ) {
+        perror("pthred_create");
+        exit(EXIT_FAILURE);
+    }
+
+    // TODO: check returned value
+    pthread_attr_destroy(&attr);
 }
 
 void accept_client_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+    static index = 0;
+
+    static pthread_mutex_t mutexes[WORKERS_COUNT] = {
+        PTHREAD_MUTEX_INITIALIZER,
+        PTHREAD_MUTEX_INITIALIZER,
+        PTHREAD_MUTEX_INITIALIZER,
+        PTHREAD_MUTEX_INITIALIZER
+    };
+
     struct ev_io_http *w = (struct ev_io_http *)watcher;
 
     int client_sd = accept(w->io.fd, 0, 0);
-    struct ev_io_http *watcher_client = (struct ev_io_http *)malloc(sizeof(struct ev_io_http));
-    watcher_client->root_dir = w->root_dir;
-    ev_io_init(&watcher_client->io, read_from_client_cb, client_sd, EV_READ);
-    ev_io_start(loop, &watcher_client->io);
+
+    struct ev_io_http *w_client = (struct ev_io_http *)malloc(sizeof(struct ev_io_http));
+    w_client->root_dir = w->root_dir;
+    w_client->index = index++ % WORKERS_COUNT;
+    w_client->mutex = &mutexes[w_client->index];
+
+    ev_io_init(&w_client->io, read_client_cb, client_sd, EV_READ);
+    ev_io_start(loop, &w_client->io);
 }
 
 void start_server(char *ip, int port, char *root_dir) {
     int sd = start_socket(ip, port);
 
     struct ev_loop *loop = ev_default_loop(0);
-    struct ev_io_http watcher_accept;
-    watcher_accept.root_dir = root_dir;
-    ev_io_init(&watcher_accept.io, accept_client_cb, sd, EV_READ);
-    ev_io_start(loop, &watcher_accept.io);
+    struct ev_io_http w_accept;
+    w_accept.root_dir = root_dir;
+    ev_io_init(&w_accept.io, accept_client_cb, sd, EV_READ);
+    ev_io_start(loop, &w_accept.io);
 
     while (1) {
         ev_loop(loop, 0);
